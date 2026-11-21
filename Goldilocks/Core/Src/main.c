@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +32,15 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define SOIL_ADC_TIMEOUT_MS       100U
+#define SENSOR_INTERVAL_MS        5000U
+#define BUTTON_DEBOUNCE_MS        200U
+#define DHT_DATA_PORT             GPIOB
+#define DHT_DATA_PIN              GPIO_PIN_0
+#define RGB_PORT                  GPIOC
+#define RGB_RED_PIN               GPIO_PIN_0
+#define RGB_GREEN_PIN             GPIO_PIN_1
+#define RGB_BLUE_PIN              GPIO_PIN_2
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -40,23 +49,160 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+typedef enum
+{
+  LED_OFF = 0,
+  LED_RED,
+  LED_GREEN,
+  LED_BLUE
+} RGB_State_t;
 
+volatile RGB_State_t rgb_state = LED_OFF;
+static uint32_t last_button_tick = 0;
+static uint32_t cycles_per_us = 84U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void DWT_Delay_Init(void);
+static void delay_us(uint32_t us);
+static uint8_t DHT11_Read(uint8_t *humidity, uint8_t *temperature);
+static uint8_t DHT11_WaitForLevel(GPIO_PinState level, uint32_t timeout_us);
+static uint16_t Soil_ReadADC(void);
+static void RGB_Set(RGB_State_t state);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* DWT cycle counter provides microsecond timing for the DHT11 protocol. */
+static void DWT_Delay_Init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  cycles_per_us = HAL_RCC_GetHCLKFreq() / 1000000U;
+  if (cycles_per_us == 0U) cycles_per_us = 1U;
+}
 
+static void delay_us(uint32_t us)
+{
+  uint32_t start = DWT->CYCCNT;
+  uint32_t cycles = us * cycles_per_us;
+  while ((uint32_t)(DWT->CYCCNT - start) < cycles) { }
+}
+
+static uint8_t DHT11_WaitForLevel(GPIO_PinState level, uint32_t timeout_us)
+{
+  uint32_t start = DWT->CYCCNT;
+  uint32_t timeout_cycles = timeout_us * cycles_per_us;
+
+  while (HAL_GPIO_ReadPin(DHT_DATA_PORT, DHT_DATA_PIN) != level)
+  {
+    if ((uint32_t)(DWT->CYCCNT - start) >= timeout_cycles)
+      return 0U;
+  }
+  return 1U;
+}
+
+/* Reads the KY-015 (DHT11-compatible) sensor. Returns 1 on valid data. */
+static uint8_t DHT11_Read(uint8_t *humidity, uint8_t *temperature)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  uint8_t data[5] = {0};
+
+  /* Host start pulse: hold DATA low for at least 18 ms. */
+  GPIO_InitStruct.Pin = DHT_DATA_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(DHT_DATA_PORT, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(DHT_DATA_PORT, DHT_DATA_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(DHT_DATA_PORT, DHT_DATA_PIN, GPIO_PIN_RESET);
+  HAL_Delay(18);
+  HAL_GPIO_WritePin(DHT_DATA_PORT, DHT_DATA_PIN, GPIO_PIN_SET);
+  delay_us(30);
+
+  /* Release the bus so the sensor can respond. */
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(DHT_DATA_PORT, &GPIO_InitStruct);
+
+  if (!DHT11_WaitForLevel(GPIO_PIN_RESET, 120U)) goto dht_error;
+  if (!DHT11_WaitForLevel(GPIO_PIN_SET, 120U)) goto dht_error;
+  if (!DHT11_WaitForLevel(GPIO_PIN_RESET, 120U)) goto dht_error;
+
+  /* Each bit starts with a low pulse, followed by a high pulse.
+     A longer high pulse represents logic 1. */
+  for (uint8_t bit = 0; bit < 40U; bit++)
+  {
+    uint32_t high_start;
+    uint32_t high_cycles;
+
+    if (!DHT11_WaitForLevel(GPIO_PIN_SET, 100U)) goto dht_error;
+    high_start = DWT->CYCCNT;
+    if (!DHT11_WaitForLevel(GPIO_PIN_RESET, 100U)) goto dht_error;
+    high_cycles = (uint32_t)(DWT->CYCCNT - high_start);
+
+    data[bit / 8U] <<= 1;
+    if (high_cycles > (40U * cycles_per_us))
+      data[bit / 8U] |= 1U;
+  }
+
+  /* Return PB0 to its idle, released open-drain state. */
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(DHT_DATA_PORT, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(DHT_DATA_PORT, DHT_DATA_PIN, GPIO_PIN_SET);
+
+  if ((uint8_t)(data[0] + data[1] + data[2] + data[3]) != data[4])
+    return 0U;
+
+  *humidity = data[0];
+  *temperature = data[2];
+  return 1U;
+
+dht_error:
+  /* Restore the pin to its idle state even if communication times out. */
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(DHT_DATA_PORT, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(DHT_DATA_PORT, DHT_DATA_PIN, GPIO_PIN_SET);
+  return 0U;
+}
+
+static uint16_t Soil_ReadADC(void)
+{
+  uint16_t value = 0;
+  if (HAL_ADC_Start(&hadc1) == HAL_OK)
+  {
+    if (HAL_ADC_PollForConversion(&hadc1, SOIL_ADC_TIMEOUT_MS) == HAL_OK)
+      value = (uint16_t)HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+  }
+  return value;
+}
+
+/* Assumes a common-cathode RGB LED module (HIGH = colour ON). */
+static void RGB_Set(RGB_State_t state)
+{
+  HAL_GPIO_WritePin(RGB_PORT, RGB_RED_PIN | RGB_GREEN_PIN | RGB_BLUE_PIN,
+                    GPIO_PIN_RESET);
+  if (state == LED_RED)
+    HAL_GPIO_WritePin(RGB_PORT, RGB_RED_PIN, GPIO_PIN_SET);
+  else if (state == LED_GREEN)
+    HAL_GPIO_WritePin(RGB_PORT, RGB_GREEN_PIN, GPIO_PIN_SET);
+  else if (state == LED_BLUE)
+    HAL_GPIO_WritePin(RGB_PORT, RGB_BLUE_PIN, GPIO_PIN_SET);
+}
 /* USER CODE END 0 */
 
 /**
@@ -89,8 +235,11 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-
+  DWT_Delay_Init();
+  RGB_Set(LED_OFF);
+  HAL_GPIO_WritePin(DHT_DATA_PORT, DHT_DATA_PIN, GPIO_PIN_SET);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -100,6 +249,46 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    static uint32_t last_sample_tick = 0;
+    static char uart_message[160];
+    uint32_t now = HAL_GetTick();
+
+    /* Reflect the latest button-selected RGB colour. */
+    RGB_Set(rgb_state);
+
+    /* Read both sensors and transmit a line every 5 seconds. */
+    if ((now - last_sample_tick) >= SENSOR_INTERVAL_MS)
+    {
+      uint16_t soil_raw;
+      uint32_t soil_millivolts;
+      uint8_t humidity = 0;
+      uint8_t temperature = 0;
+      uint8_t dht_ok;
+      int length;
+
+      last_sample_tick = now;
+      soil_raw = Soil_ReadADC();
+      soil_millivolts = ((uint32_t)soil_raw * 3300U) / 4095U;
+      dht_ok = DHT11_Read(&humidity, &temperature);
+
+      if (dht_ok)
+      {
+        length = snprintf(uart_message, sizeof(uart_message),
+                          "Soil_ADC=%u, Soil_mV=%lu, Temperature=%u C, Humidity=%u %%\r\n",
+                          soil_raw, (unsigned long)soil_millivolts,
+                          temperature, humidity);
+      }
+      else
+      {
+        length = snprintf(uart_message, sizeof(uart_message),
+                          "Soil_ADC=%u, Soil_mV=%lu, DHT11=READ_ERROR\r\n",
+                          soil_raw, (unsigned long)soil_millivolts);
+      }
+
+      if (length > 0)
+        HAL_UART_Transmit(&huart2, (uint8_t *)uart_message,
+                          (uint16_t)length, HAL_MAX_DELAY);
+    }
   }
   /* USER CODE END 3 */
 }
@@ -148,6 +337,58 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -202,13 +443,26 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PC0 PC1 PC2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LD2_Pin */
   GPIO_InitStruct.Pin = LD2_Pin;
@@ -217,13 +471,35 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PB0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == B1_Pin)
+  {
+    uint32_t tick = HAL_GetTick();
+    if ((tick - last_button_tick) >= BUTTON_DEBOUNCE_MS)
+    {
+      last_button_tick = tick;
+      rgb_state = (RGB_State_t)((rgb_state + 1U) % 4U);
+    }
+  }
+}
 /* USER CODE END 4 */
 
 /**
