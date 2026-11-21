@@ -1,0 +1,19 @@
+node_modules/
+
+# STM32CubeIDE build output
+Debug/
+Release/
+
+# ESP32 (PlatformIO / Arduino)
+.pio/
+build/
+
+# Web (Next.js)
+.next/
+.env*.local
+
+# Python / OS / editor
+__pycache__/
+.DS_Store
+Thumbs.db
+.vscode/
